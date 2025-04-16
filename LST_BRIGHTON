@@ -1,0 +1,374 @@
+//region is a imported shapefile or drawn region on mpa or specified coordinates
+// ==================== PARAMETERS ====================
+var maxCloudCover = 20; // Allow images with < 20% cloud cover
+var years = ee.List.sequence(1994, 2024);
+var months = ee.List.sequence(6, 8); // June to August
+
+// ==================== SCALE + MASK FUNCTIONS ====================
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  var thermalBandsL5L7 = image.select('ST_B6', 'QA_PIXEL').multiply(0.00341802).add(149.0);
+  var thermalBandsL8L9 = image.select('ST_B10', 'QA_PIXEL').multiply(0.00341802).add(149.0);
+
+  var imgWithOptical = image.addBands(opticalBands, null, true);
+
+  var thermalToAdd = ee.Algorithms.If(
+      image.bandNames().contains('ST_B10'),
+      thermalBandsL8L9.select('ST_B10'),
+      thermalBandsL5L7.select('ST_B6')
+  );
+
+  return imgWithOptical.addBands(ee.Image(thermalToAdd), null, true);
+}
+
+function cloudMask(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudShadowBitmask = (1 << 3);
+  var cloudBitmask = (1 << 5);
+  var mask = qa.bitwiseAnd(cloudShadowBitmask).eq(0)
+                .and(qa.bitwiseAnd(cloudBitmask).eq(0));
+  return image.updateMask(mask);
+}
+
+// ==================== LST CONVERSION ====================
+function extractLST(img, bandName) {
+  var lstCelsius = img.select(bandName).subtract(273.15).rename('LST');
+  lstCelsius = lstCelsius.copyProperties(img, ['system:time_start']);
+  return lstCelsius;
+}
+
+// ==================== IMAGE COLLECTIONS ====================
+var L5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .filterBounds(region)
+  .filter(ee.Filter.lt('CLOUD_COVER', maxCloudCover))
+  .map(applyScaleFactors)
+  .map(cloudMask)
+  .map(function(img) {
+    return extractLST(img, 'ST_B6');
+  })
+  .select('LST');
+
+var L8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(region)
+  .filter(ee.Filter.lt('CLOUD_COVER', maxCloudCover))
+  .map(applyScaleFactors)
+  .map(cloudMask)
+  .map(function(img) {
+    return extractLST(img, 'ST_B10');
+  })
+  .select('LST');
+
+var L9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+  .filterBounds(region)
+  .filter(ee.Filter.lt('CLOUD_COVER', maxCloudCover))
+  .map(applyScaleFactors)
+  .map(cloudMask)
+  .map(function(img) {
+    return extractLST(img, 'ST_B10');
+  })
+  .select('LST');
+
+// Merge collections
+var collection = L5.merge(L8).merge(L9).sort('system:time_start');
+
+// ==================== COUNT IMAGES PER YEAR (USED MONTHS) ====================
+// This counts images within the specified months for each year from the merged collection
+var annualImageCounts = ee.FeatureCollection(
+  years.map(function(y) {
+    y = ee.Number(y);
+
+    // Filter the merged collection for the specific year AND the specified months
+    var imagesInYearMonths = collection
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .filter(ee.Filter.calendarRange(6, 8, 'month')); // Filter for June to August
+
+    // Count the number of images found for that year and month range
+    var count = imagesInYearMonths.size();
+
+    // Create a feature storing the year and the count
+    return ee.Feature(null, {
+      'year': y,
+      'image_count': count
+    });
+  })
+);
+
+// ==================== IMAGE COUNT CHART ====================
+// Create a chart showing the number of images per year
+var countChart = ui.Chart.feature.byFeature({
+    features: annualImageCounts,
+    xProperty: 'year',
+    yProperties: ['image_count']
+  })
+  .setChartType('ColumnChart') // Column chart is often suitable for counts
+  .setOptions({
+    title: 'Number of Usable Images Per Year (June-August)',
+    hAxis: {title: 'Year', format: '####'}, // Format year without comma
+    vAxis: {title: 'Number of Images', minValue: 0}, // Ensure Y-axis starts at 0
+    legend: { position: 'none' }, // Hide legend as there's only one series
+    colors: ['#1f77b4'] // Example color (blue)
+  });
+
+// Print the chart to the console
+print(countChart);
+
+// ==================== MONTHLY MEANS ====================
+var yearMonthCombos = years.map(function(y) {
+  return months.map(function(m) {
+    return ee.Dictionary({year: y, month: m});
+  });
+}).flatten();
+
+var monthlyMeans = ee.FeatureCollection(
+  yearMonthCombos.map(function(dict) {
+    dict = ee.Dictionary(dict);
+    var year = ee.Number(dict.get('year'));
+    var month = ee.Number(dict.get('month'));
+
+    var start = ee.Date.fromYMD(year, month, 1);
+    var end = start.advance(1, 'month');
+
+    var filtered = collection.filterDate(start, end);
+
+    var meanVal = ee.Algorithms.If(
+      filtered.size().gt(0),
+      filtered.mean().reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: region,
+        scale: 30,
+        maxPixels: 1e9
+      }).get('LST'),
+      null
+    );
+
+    return ee.Feature(null, {
+      'year': year,
+      'month': month,
+      'meanLST': meanVal
+    });
+  })
+);
+
+// ==================== FILL MISSING MONTHLY VALUES ====================
+var filledMonthly = monthlyMeans.map(function(feat) {
+  var year = ee.Number(feat.get('year'));
+  var month = ee.Number(feat.get('month'));
+  var value = feat.get('meanLST');
+
+  var filledVal = ee.Algorithms.If(
+    ee.Algorithms.IsEqual(value, null),
+    monthlyMeans
+      .filter(ee.Filter.eq('month', month))
+      .filter(ee.Filter.rangeContains('year', year.subtract(4), year.add(4)))
+      .aggregate_mean('meanLST'),
+    value
+  );
+
+  return ee.Feature(null, {
+    'year': year,
+    'month': month,
+    'meanLST': filledVal
+  });
+});
+
+// ==================== ANNUAL MEANS ====================
+var annualMeans = ee.FeatureCollection(
+  years.map(function(y) {
+    y = ee.Number(y);
+    var yearData = filledMonthly.filter(ee.Filter.eq('year', y));
+    var meanOfYear = yearData.aggregate_mean('meanLST');
+
+    return ee.Feature(null, {
+      'year': y,
+      'meanLST': meanOfYear
+    });
+  })
+);
+
+// ==================== CHART ====================
+var chart = ui.Chart.feature.byFeature(annualMeans, 'year', ['meanLST'])
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Annual Mean LST (Filled)',
+    hAxis: {title: 'Year'},
+    vAxis: {title: 'LST (°C)'},
+    lineWidth: 2,
+    pointSize: 4,
+    series: {0: {color: 'red'}}
+  });
+
+print(chart);
+print('Annual Mean LST Collection:', annualMeans);
+
+// ==================== PER-PIXEL LINEAR REGRESSION ANALYSIS ====================
+// Much simpler approach for per-pixel linear regression
+
+// Create annual summer composites with year as an image band
+var annualComposites = years.map(function(year) {
+  year = ee.Number(year);
+  
+  // Define summer period for this year
+  var startDate = ee.Date.fromYMD(year, 6, 1);
+  var endDate = ee.Date.fromYMD(year, 8, 31);
+  
+  // Get images for this summer period
+  var summerImages = collection
+    .filterDate(startDate, endDate);
+  
+  // If we have images, create a composite with a year band
+  var composite = ee.Algorithms.If(
+    summerImages.size().gt(0),
+    summerImages.mean()
+      .addBands(ee.Image.constant(year).float().rename('year'))
+      .set('system:time_start', startDate.millis()),
+    null
+  );
+  
+  return composite;
+});
+
+// Filter out nulls
+var validComposites = ee.ImageCollection(annualComposites.removeAll([null]));
+
+// Add an independent variable (constant 1) for the intercept
+var withConstant = validComposites.map(function(img) {
+  return img.addBands(ee.Image.constant(1).rename('constant'));
+});
+
+// Compute the linear regression coefficients
+// Use built-in linearFit reducer which is more stable
+var trend = withConstant
+  .select(['constant', 'year', 'LST'])
+  .reduce(ee.Reducer.linearRegression(2, 1));
+
+// Extract the slope and intercept
+var coefficients = trend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([['intercept', 'slope']]);
+
+// Get just the slope band which shows rate of change per year
+var slope = coefficients.select('slope');
+
+// Calculate total change over the study period (30 years)
+var totalChange = slope.multiply(30);
+
+// Simple significance mask based on magnitude
+// Areas with very small change are treated as no significant change
+var significantSlope = slope.abs().gt(0.02);  // Arbitrary threshold, adjust as needed
+
+// Calculate region-wide average slope
+var meanSlope = slope.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: region,
+  scale: 90,
+  maxPixels: 1e9
+});
+
+// Visualize the results with a color ramp
+var palette = ['blue', 'cyan', 'white', 'yellow', 'red'];
+
+// Add the slope layer (rate of change per year)
+Map.addLayer(slope.clip(region), {
+  min: -0.1,  // Adjust based on your data
+  max: 0.1,
+  palette: palette
+}, 'LST Annual Rate of Change (°C/year)');
+
+// Add the total change layer
+Map.addLayer(totalChange.clip(region), {
+  min: -3,  // Adjust based on your data
+  max: 3,
+  palette: palette
+}, 'LST Total Change 1994-2024 (°C)');
+
+// Add the significant change mask
+Map.addLayer(slope.updateMask(significantSlope).clip(region), {
+  min: -0.1,
+  max: 0.1,
+  palette: palette
+}, 'Significant LST Change');
+
+// Create a legend
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'LST Change (°C)',
+  style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 4px 0', padding: '0'}
+});
+legend.add(legendTitle);
+
+// Create colorbar
+var colors = palette;
+var legendValues = [-3, -1.5, 0, 1.5, 3];
+
+for (var i = 0; i < colors.length; i++) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: colors[i],
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+  
+  var valueLabel = ui.Label({
+    value: legendValues[i],
+    style: {margin: '0 0 4px 6px'}
+  });
+  
+  var entry = ui.Panel({
+    widgets: [colorBox, valueLabel],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+  
+  legend.add(entry);
+}
+
+Map.add(legend);
+
+print('Average Annual Rate of Change:', meanSlope.get('slope'), '°C/year');
+print('Estimated Total Change (30 years):', ee.Number(meanSlope.get('slope')).multiply(30), '°C');
+
+// Center map on region
+Map.centerObject(region, 10);  // Adjust zoom level as needed
+
+// ==================== EXPORT THE IMAGES ====================
+
+// Export the Annual Rate of Change image
+Export.image.toDrive({
+  image: slope.clip(region),
+  description: 'LST_Annual_Rate_of_Change_1994_2024',
+  folder: 'GEE_Exports', // Replace with your desired folder name
+  scale: 30, // Or your desired resolution
+  region: region,
+  crs: 'EPSG:4326', // Or your desired CRS
+  maxPixels: 1e9
+});
+
+// Export the Total Change image
+Export.image.toDrive({
+  image: totalChange.clip(region),
+  description: 'LST_Total_Change_1994_2024',
+  folder: 'GEE_Exports', // Replace with your desired folder name
+  scale: 30, // Or your desired resolution
+  region: region,
+  crs: 'EPSG:4326', // Or your desired CRS
+  maxPixels: 1e9
+});
+
+// Export the Significant LST Change mask (you might want to export it as a binary mask)
+Export.image.toDrive({
+  image: significantSlope.clip(region),
+  description: 'Significant_LST_Change_Mask_1994_2024',
+  folder: 'GEE_Exports', // Replace with your desired folder name
+  scale: 30, // Or your desired resolution
+  region: region,
+  crs: 'EPSG:4326', // Or your desired CRS
+  maxPixels: 1e9
+});
+
+print('Export tasks submitted to the Tasks tab.');
